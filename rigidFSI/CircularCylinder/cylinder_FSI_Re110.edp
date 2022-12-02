@@ -1,0 +1,273 @@
+////////////////////////////////////////////////////////////////////////////////////
+//
+// An FSI solver for fluid rigid-solid interaction with incompressible Navier-Stokes
+//
+// Case  : Flow past a spring-damper mounted circular cylinder for Re=110
+//
+// Author: Dr Chennakesava Kadapa
+// Date  : 02-Dec-2022
+//
+////////////////////////////////////////////////////////////////////////////////////
+
+load "gmsh"
+load "iovtk"
+
+// Parameters
+
+real rho = 1.0;   // fluid density
+real  mu = 0.01;  // fluid viscosity
+real eps = 1e-8;  // tolerance
+
+real Re  = 110.0; // Reynolds number
+real dt  = 0.1;   // Time step size
+
+real inletVeloX = Re*mu/rho;
+real inletVeloY = 0.0;
+
+// load the mesh file
+mesh Th = gmshload("cylinder-gmsh1.msh");
+
+// define labels for boundaries
+int inlet       = 1;
+int outlet      = 2;
+int topwall     = 3;
+int bottomwall  = 4;
+int cylinder    = 5;
+
+
+// FE space for velocity and mesh
+fespace Xh(Th, P2);
+Xh fluidVeloX, fluidVeloY;
+Xh vX, vY; // test functions
+Xh fluidVeloXp,fluidVeloYp;
+Xh fluidAcceX, fluidAcceY, fluidAcceXp,fluidAcceYp, vorticityZ;
+
+Xh meshDispX, meshDispY, meshDispXp, meshDispYp, meshVeloX, meshVeloY, meshVeloXp, meshVeloYp;
+
+// FE space for pressure
+fespace Mh(Th,P1);
+Mh fluidPres;
+Mh q; // test function
+Mh fluidPresp;
+
+// Macros
+macro Grad(fluidVeloX,fluidVeloY) [dx(fluidVeloX), dy(fluidVeloX), dx(fluidVeloY), dy(fluidVeloY)] //
+macro UgradV(fluidVeloX,fluidVeloY,vX,vY) [[fluidVeloX,fluidVeloY]'*[dx(vX),dy(vX)],
+                        [fluidVeloX,fluidVeloY]'*[dx(vY),dy(vY)]] //
+macro div(fluidVeloX,fluidVeloY) (dx(fluidVeloX) + dy(fluidVeloY)) //
+macro epsilon(solidDispX,solidDispY) [dx(solidDispX), 0.5*(dy(solidDispX)+dx(solidDispY)), 0.5*(dy(solidDispX)+dx(solidDispY)), dy(solidDispY)] //
+
+// Initialization
+fluidVeloX = inletVeloX;
+fluidVeloY = inletVeloY;
+fluidPres  = 0.0;
+
+fluidVeloXp = fluidVeloX;
+fluidVeloYp = fluidVeloY;
+fluidPresp  = fluidPres;
+
+// Time integration parameters
+real rhoInf = 0.0;
+real af = 1.0/(1.0+rhoInf);
+real am = 0.5*(3.0-rhoInf)/(1.0+rhoInf);
+real gamma = 0.5+am-af;
+real acceFact1 = am/(gamma*dt);
+real acceFact2 = (gamma-am)/gamma;
+
+real[int]  td = [0.0, 0.0, 0.0, 0.0];
+td[0] = 1.0/gamma/dt;
+td[1] = (gamma-1.0)/gamma;
+
+// some auxiliary variables
+int[int] Order = [1];
+
+int timestep;
+real err=0;
+real loadfactor=0.0;
+real timeNow = 0.0, forceX, forceY;
+
+
+// open the file for writing forces and displacements
+ofstream outputfile("cylinder-FSI-output.dat");
+outputfile.precision(16);
+
+
+// Parameters for mesh motion
+real Emesh = 1.0;
+real numesh = 0.3;
+real mumesh = Emesh/(2*(1+numesh));
+real lambdamesh = Emesh*numesh/((1+numesh)*(1-2*numesh));
+
+
+// Parameters for the solid problem
+real ms = 117.10;
+real cs = 0.35317;
+real ks = 184.92;
+real Keff, temp;
+real solidDispX=0.0, solidDispY=0.0, solidDispXp=0.0, solidDispYp=0.0, solidDispXincr=0.0, solidDispYincr=0.0;
+real solidVeloX=0.0, solidVeloY=0.0, solidVeloXp=0.0, solidVeloYp=0.0;
+real solidDispDotX=0.0, solidDispDotY=0.0, solidDispDotXp=0.0, solidDispDotYp=0.0;
+real solidVeloDotX=0.0, solidVeloDotY=0.0, solidVeloDotXp=0.0, solidVeloDotYp=0.0;
+real solidForce=0.0, solidForcep=0.0, solidForcep2=0.0, forcePredX, forcePredY;
+
+real beta = 0.9; // relaxation parameter
+
+// write t=0 data to file
+outputfile << timeNow << "\t" << forceX << "\t" << forceY << "\t" << solidDispY << "\t" << solidVeloY << endl;
+outputfile.flush;
+
+// Time loop
+for (timestep = 1; timestep < 10000; timestep++)
+{
+    timeNow += dt;
+    loadfactor = 1.0;
+    //if(timeNow > 1.0)      loadfactor = 1.0;
+
+    cout << " Timestep       =  "  << timestep << endl;
+    cout << " Current time   =  "  << timeNow  << endl;
+    cout << endl;
+
+    //
+    // Step 1: force predictor
+    //
+
+    forcePredY = 2.0*solidForcep - solidForcep2;
+
+    //
+    // Step 2: Solid problem
+    //
+    //cout << "Step 2: Solid problem " << endl;
+
+    solidForce = forcePredY;
+
+    Keff = (am*am/(af*gamma*gamma*dt*dt))*ms+(am/gamma/dt)*cs+af*ks;
+
+    temp  = solidForce-(1.0-am)*ms*solidVeloDotYp-(1.0-af)*cs*solidVeloY-(1.0-af)*ks*solidDispYp;
+    temp += af*cs*( (am/af/gamma/dt)*solidDispYp - ((gamma-am)/gamma/af)*solidDispDotYp - (1.0-1.0/af)*solidVeloYp);
+    temp += am*ms*( (am/(af*gamma*gamma*dt*dt))*solidDispYp + (1.0/af/gamma/dt)*solidVeloYp - (1.0-1.0/gamma)*solidVeloDotYp - ((gamma-am)/af/gamma/gamma/dt)*solidDispDotYp  );
+
+    solidDispY = temp/Keff;
+
+    // calculate velocity and acceleration
+    solidDispDotY = td[0]*(solidDispY-solidDispYp)+td[1]*solidDispDotYp;
+    solidVeloY    = (am/af/gamma/dt)*(solidDispY-solidDispYp)+((gamma-am)/gamma/af)*solidDispDotYp + (1.0-1.0/af)*solidVeloYp;
+
+    solidVeloDotY = td[0]*(solidVeloY-solidVeloYp)+td[1]*solidVeloDotYp;
+
+    // Step 3: Mesh update
+    //cout << "Step 3: Mesh update " << endl;
+
+    solidDispXincr = solidDispX - solidDispXp;
+    solidDispYincr = solidDispY - solidDispYp;
+
+    solve meshproblem([meshDispX, meshDispY], [vX, vY])
+       = int2d(Th)(
+            lambdamesh * div(meshDispX, meshDispY) * div(vX, vY)
+          + 2.0*mumesh * ( epsilon(meshDispX,meshDispY)' * epsilon(vX,vY) )
+       )
+       + on(inlet,      meshDispX=0, meshDispY=0)
+       + on(outlet,     meshDispX=0, meshDispY=0)
+       + on(bottomwall, meshDispX=0, meshDispY=0)
+       + on(topwall,    meshDispX=0, meshDispY=0)
+       + on(cylinder,   meshDispX=solidDispXincr, meshDispY=solidDispYincr)
+       ;
+
+    // calculate mesh velocity
+    meshVeloX = td[0]*(meshDispX-meshDispXp) + td[1]*meshVeloXp;
+    meshVeloY = td[0]*(meshDispY-meshDispYp) + td[1]*meshVeloYp;
+
+    //mesh ThFluidMoved = movemesh(ThFluid, [x+meshDispX, y+meshDispY]);
+    Th = movemesh(Th, [x+meshDispX, y+meshDispY]);
+
+    // Step 4: Fluid problem
+
+    solve NSChenna ([fluidVeloX, fluidVeloY, fluidPres], [vX, vY, q])
+        = int2d(Th)(
+            rho*acceFact1 * ( [fluidVeloX,fluidVeloY]' * [vX,vY] )
+            + mu * (Grad(fluidVeloX,fluidVeloY)' * Grad(vX,vY))
+            + [(fluidVeloXp-meshVeloX)*dx(fluidVeloX)+(fluidVeloYp-meshVeloY)*dy(fluidVeloX), (fluidVeloXp-meshVeloX)*dx(fluidVeloY)+(fluidVeloYp-meshVeloY)*dy(fluidVeloY) ]' * [vX,vY]
+            + [fluidVeloX*dx(fluidVeloXp)+fluidVeloY*dy(fluidVeloXp), fluidVeloX*dx(fluidVeloYp)+fluidVeloY*dy(fluidVeloYp) ]' * [vX,vY]
+            - div(fluidVeloX,fluidVeloY) * q
+            - div(vX,vY) * fluidPres
+            - 1e-8*fluidPres*q //stabilization term
+        )
+        - int2d(Th) (
+            + rho*acceFact1 * ( [fluidVeloXp,fluidVeloYp]' * [vX,vY] )
+            - rho*acceFact2 * ( [fluidAcceXp,fluidAcceYp]' * [vX,vY] )
+            + [fluidVeloXp*dx(fluidVeloXp)+fluidVeloYp*dy(fluidVeloXp), fluidVeloXp*dx(fluidVeloYp)+fluidVeloYp*dy(fluidVeloYp) ]' * [vX,vY]
+        )
+        + on(inlet,      fluidVeloX=loadfactor*inletVeloX, fluidVeloY=0)
+        + on(bottomwall, fluidVeloY=0)
+        + on(topwall,    fluidVeloY=0)
+        + on(cylinder,   fluidVeloX=solidVeloX, fluidVeloY=solidVeloY)
+        ;
+
+    fluidAcceX = td[0]*(fluidVeloX-fluidVeloXp) + td[1]*fluidAcceXp;
+    fluidAcceY = td[0]*(fluidVeloY-fluidVeloYp) + td[1]*fluidAcceYp;
+
+    Xh u1error = fluidVeloX-fluidVeloXp, u2error = fluidVeloY-fluidVeloYp;
+    //real Lu1=fluidVeloX[].linfty, Lu2=fluidVeloY[].linfty, Lp=fluidPres[].linfty;
+    err = u1error[].linfty + u2error[].linfty;
+
+    // calculate forces and write to file
+    forceX = int1d(Th, cylinder)((mu*dx(fluidVeloX)-fluidPres)*N.x+(mu*dy(fluidVeloX))*N.y);
+    forceY = int1d(Th, cylinder)((mu*dx(fluidVeloY))*N.x+(mu*dy(fluidVeloY)-fluidPres)*N.y);
+
+    // relax forces
+    solidForce = -beta*forceY + (1.0-beta)*forcePredY;
+
+    // save variables
+    fluidVeloXp = fluidVeloX;
+    fluidVeloYp = fluidVeloY;
+    fluidPresp  = fluidPres;
+
+    fluidAcceXp = fluidAcceX;
+    fluidAcceYp = fluidAcceY;
+
+    solidForcep2 = solidForcep;
+    solidForcep  = solidForce;
+
+    solidDispXp = solidDispX;
+    solidDispYp = solidDispY;
+
+    solidVeloXp = solidVeloX;
+    solidVeloYp = solidVeloY;
+
+    solidDispDotXp = solidDispDotX;
+    solidDispDotYp = solidDispDotY;
+
+    solidVeloDotXp = solidVeloDotX;
+    solidVeloDotYp = solidVeloDotY;
+
+    meshDispXp = meshDispX;
+    meshDispYp = meshDispY;
+
+    meshVeloXp = meshVeloX;
+    meshVeloYp = meshVeloY;
+
+    // write to file
+    outputfile << timeNow << "\t" << forceX << "\t" << forceY << "\t" << solidDispY << "\t" << solidVeloY << endl;
+    outputfile.flush;
+
+    // write output in VTK format
+    if( (timestep % 5) == 0)
+    {
+      string filename = "cylinder-FSI-Re110-velocity-" + string(timestep) + ".vtu";
+      savevtk(filename, Th, [fluidVeloX, fluidVeloY, 0], dataname="velo", order=Order);
+
+      filename = "cylinder-FSI-Re110-pressure-" + string(timestep) + ".vtu";
+      savevtk(filename, Th, fluidPres,  dataname="pres", order=Order);
+
+      //solve vort (vorticityZ, vX)
+      //  = int2d(Th)(
+      //      vorticityZ*vX
+      //  )
+      //  - int2d(Th)(
+      //      ( dx(fluidVeloY)-dy(fluidVeloX) )*vX
+      //  );
+      //
+      //filename = "cylinder-FSI-Re110-vorticity-" + string(timestep) + ".vtu";
+      //savevtk(filename, Th, vorticityZ, dataname="vortz", order=Order);
+    }
+    cout << endl;
+}
